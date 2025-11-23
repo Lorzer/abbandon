@@ -1,0 +1,35 @@
+{
+  "name": "abbadon-phase1",
+  "version": "1.0.0",
+  "description": "ABBADON Phase 1 - Climate collapse simulation prototype",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "start": "node --loader ts-node/esm src/server.ts",
+    "dev": "node --watch --loader ts-node/esm src/server.ts",
+    "build": "tsc",
+    "clean": "rm -rf dist *.db"
+  },
+  "keywords": [
+    "simulation",
+    "climate",
+    "strategy"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "better-sqlite3": "^11.7.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  }
+}

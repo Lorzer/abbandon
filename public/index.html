@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ABBADON Phase 1 - Climate Collapse Simulation</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="container">
+      <!-- Left Panel: Controls & Info -->
+      <div class="left-panel">
+        <header>
+          <h1>ABBADON</h1>
+          <p class="subtitle">Phase 1 Prototype</p>
+        </header>
+
+        <!-- Controls -->
+        <section class="controls">
+          <h2>Controls</h2>
+          <div class="button-group">
+            <button id="playBtn" class="btn btn-primary">▶ Play</button>
+            <button id="pauseBtn" class="btn" disabled>⏸ Pause</button>
+            <button id="stepBtn" class="btn">⏭ Step</button>
+            <button id="resetBtn" class="btn btn-danger">🔄 Reset</button>
+          </div>
+        </section>
+
+        <!-- Metrics -->
+        <section class="metrics">
+          <h2>Global Metrics</h2>
+          <div class="metric">
+            <span class="metric-label">Round:</span>
+            <span class="metric-value" id="metricRound">0</span>
+            <span class="metric-max">/ 60</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Total Population:</span>
+            <span class="metric-value" id="metricPopulation">0</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Urban Population:</span>
+            <span class="metric-value" id="metricUrbanPop">0</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Rural Population:</span>
+            <span class="metric-value" id="metricRuralPop">0</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Total Food:</span>
+            <span class="metric-value" id="metricFood">0</span>
+            <span class="metric-max">tons</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Total Deaths:</span>
+            <span class="metric-value" id="metricDeaths">0</span>
+          </div>
+        </section>
+
+        <!-- Selected Hex Details -->
+        <section class="hex-details">
+          <h2>Selected Hex</h2>
+          <div id="hexDetailsContent" class="hex-details-content">
+            <p class="placeholder">Click a hex to view details</p>
+          </div>
+        </section>
+
+        <!-- Console Log -->
+        <section class="console">
+          <h2>Event Log</h2>
+          <div id="consoleLog" class="console-log"></div>
+        </section>
+      </div>
+
+      <!-- Right Panel: Hex Grid Visualization -->
+      <div class="right-panel">
+        <div class="canvas-container">
+          <canvas id="hexCanvas"></canvas>
+        </div>
+
+        <!-- Legend -->
+        <div class="legend">
+          <h3>Population Density</h3>
+          <div class="legend-items">
+            <div class="legend-item">
+              <span class="legend-color" style="background: #2d5016"></span>
+              <span>Low (&lt;5k)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color" style="background: #4a7c1e"></span>
+              <span>Medium (5k-15k)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color" style="background: #d17a22"></span>
+              <span>High (15k-30k)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color" style="background: #c0392b"></span>
+              <span>Very High (30k+)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color" style="background: #1a1a1a"></span>
+              <span>Depleted (&lt;100)</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
