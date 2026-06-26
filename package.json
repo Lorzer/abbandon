@@ -8,6 +8,7 @@
     "start": "node --loader ts-node/esm src/server.ts",
     "dev": "node --watch --loader ts-node/esm src/server.ts",
     "build": "tsc",
+    "test": "TS_NODE_TRANSPILE_ONLY=1 node --loader ts-node/esm --test test/*.test.ts",
     "clean": "rm -rf dist *.db"
   },
   "keywords": [

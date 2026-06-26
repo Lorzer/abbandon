@@ -6,6 +6,25 @@ A strategic simulation prototype that models climate-induced societal collapse i
 
 ABBADON Phase 1 is a **pure simulation prototype** - no player interaction yet, just observing the system evolve. The goal is to validate the core engine before adding player controls in Phase 2.
 
+> **Collapse is the premise.** The climate catastrophe *will* lead to collapse; the engine is
+> not meant to reach a survivable equilibrium. The tunable factors shape the *pace and spatial
+> texture* of that collapse (urban-first, gradual, uneven).
+
+### Tunable, reproducible engine
+
+- **All factors live in `src/config.ts`** (`SimConfig`) - consumption, force weights, migration,
+  decay, starvation, world generation. Tune them via the `GET`/`POST /api/config` endpoints
+  instead of editing engine code. World-gen changes (seed/world) regenerate the map; everything
+  else applies live to the next round.
+- **Deterministic mode:** with `useLLM: false` (the default) a `ScriptedDirector` drives weather
+  parametrically. Same `seed` + same config ⇒ identical run, so you can isolate the effect of a
+  factor change. Set `useLLM: true` (and `GOOGLE_API_KEY`) for LLM-driven narrative.
+- **History / rewind:** every round is snapshotted (namespaced by run id, kept across resets).
+  `GET /api/history/:round` reads a snapshot; `POST /api/fork {round}` rewinds live state to that
+  round and re-simulates forward.
+- **Tests:** `npm test` covers determinism, population conservation, collapse pacing, and transit
+  deaths.
+
 ### What It Simulates
 
 - **100 hexagons** (20 urban, 80 rural) representing the region
@@ -91,12 +110,12 @@ Open your browser to: **http://localhost:3000**
 8. Starvation deaths (no food = 10% die)
 9. Update state and save history
 
-### Token Efficiency
+### Token Efficiency (LLM mode only)
 
-- **Round 1**: Full state (~10k tokens)
-- **Rounds 2-60**: Only changes (~1k tokens each)
-- **Total**: ~70k tokens vs 600k if sending full state every round
-- **Savings**: 88%
+The changes-only prompt keeps each round's *new* text small. Note that the Gemini chat session
+also re-sends accumulated history every turn, so cumulative input tokens still grow over a run -
+the changes-only prompt reduces, but does not flatten, total cost. For fully reproducible,
+zero-token runs, use the deterministic scripted director (`useLLM: false`).
 
 ## Tech Stack
 

@@ -5,8 +5,10 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import type Database from 'better-sqlite3';
 import type { LLMDecision, Hexagon, GameState, HexChange } from './types.js';
+import type { Director } from './director.js';
+import { clampDecision } from './director.js';
 
-export class LLMDirector {
+export class LLMDirector implements Director {
   private genAI: GoogleGenerativeAI;
   private chat: any;
   private previousHexagons: Map<string, Hexagon> = new Map();
@@ -52,7 +54,8 @@ export class LLMDirector {
       const jsonMatch = responseText.match(/```json\n?([\s\S]*?)\n?```/) || responseText.match(/([\s\S]*)/);
       const jsonText = jsonMatch ? jsonMatch[1].trim() : responseText.trim();
 
-      const decision: LLMDecision = JSON.parse(jsonText);
+      // Validate + clamp so a single bad generation can't inject extreme values.
+      const decision: LLMDecision = clampDecision(JSON.parse(jsonText));
 
       // Store current state for next round's change detection
       this.storePreviousState(db);
@@ -60,6 +63,8 @@ export class LLMDirector {
       return decision;
     } catch (error) {
       console.error('LLM Error:', error);
+      // Persist the snapshot even on failure so change detection stays anchored.
+      this.storePreviousState(db);
       return this.getFallbackDecision(round);
     }
   }
@@ -98,12 +103,13 @@ GLOBAL METRICS:
 - Total Food: ${totalFood.toFixed(0)} tons
 - Deaths: ${gameState.total_deaths}
 
-CRITICAL HEXAGONS (showing first 10 for context):
+REPRESENTATIVE HEXAGONS (urban + rural sample):
 `;
 
-    // Show 10 representative hexes
-    for (let i = 0; i < Math.min(10, hexagons.length); i++) {
-      const hex = hexagons[i];
+    // Show a sample that includes BOTH urban and rural hexes (the first 20 are
+    // all urban, so naively taking the first 10 would hide every rural hex).
+    const sample = [...urbanHexes.slice(0, 5), ...ruralHexes.slice(0, 5)];
+    for (const hex of sample) {
       prompt += `${hex.id} [${hex.type}]: ${hex.population.toLocaleString()} pop, ${hex.food_stored_tons.toFixed(1)}t food, ${hex.water_availability.toFixed(0)}% water, infra ${((hex.infrastructure_power + hex.infrastructure_water + hex.infrastructure_roads) / 3).toFixed(0)}%, violence ${hex.violence_level}\n`;
     }
 

@@ -1,28 +1,51 @@
 /**
- * ABBADON Phase 1 - Database Initialization and World Creation
+ * ABBADON - Database Initialization and World Creation
+ *
+ * The world is generated entirely from SimConfig + a seeded RNG, so a given
+ * (seed, config) pair always produces the same starting world.
  */
 
 import Database from 'better-sqlite3';
 import type { Hexagon, GameState, Edge } from './types.js';
+import type { SimConfig, HexTemplate } from './config.js';
+import { RNG } from './rng.js';
 
 export class DatabaseInitializer {
   private db: Database.Database;
+  private config: SimConfig;
+  private runId: string;
+  private runCounter = 0;
 
-  constructor(dbPath: string = './abbadon.db') {
+  constructor(dbPath: string = './abbadon.db', config: SimConfig) {
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
+    this.config = config;
+    this.runId = this.makeRunId();
   }
 
   getDatabase(): Database.Database {
     return this.db;
   }
 
+  getRunId(): string {
+    return this.runId;
+  }
+
+  setConfig(config: SimConfig): void {
+    this.config = config;
+  }
+
+  private makeRunId(): string {
+    // Unique per run so history from previous runs survives a reset. Wall clock
+    // + a monotonic counter is only used to disambiguate ids, never for math.
+    return `run-${this.config.seed}-${Date.now()}-${this.runCounter++}`;
+  }
+
   /**
-   * Initialize the complete database schema
+   * Initialize the complete database schema.
    */
   initializeDatabase(): void {
     this.db.exec(`
-      -- Hexagons table: Current state of all 100 hexes
       CREATE TABLE IF NOT EXISTS hexagons (
         id TEXT PRIMARY KEY,
         type TEXT NOT NULL CHECK(type IN ('urban', 'rural')),
@@ -44,7 +67,6 @@ export class DatabaseInitializer {
         grid_y INTEGER NOT NULL
       );
 
-      -- Edges table: Connections between adjacent hexagons
       CREATE TABLE IF NOT EXISTS edges (
         from_hex_id TEXT NOT NULL,
         to_hex_id TEXT NOT NULL,
@@ -54,9 +76,9 @@ export class DatabaseInitializer {
         FOREIGN KEY (to_hex_id) REFERENCES hexagons(id)
       );
 
-      -- Game state table: Global simulation state
       CREATE TABLE IF NOT EXISTS game_state (
         id INTEGER PRIMARY KEY CHECK(id = 1),
+        run_id TEXT NOT NULL,
         current_round INTEGER NOT NULL,
         total_population INTEGER NOT NULL,
         total_food_tons REAL NOT NULL,
@@ -65,8 +87,9 @@ export class DatabaseInitializer {
         deaths_transit INTEGER NOT NULL
       );
 
-      -- History table: Snapshots for each round
+      -- History snapshots, namespaced by run_id so past runs survive a reset.
       CREATE TABLE IF NOT EXISTS history (
+        run_id TEXT NOT NULL,
         round INTEGER NOT NULL,
         hex_id TEXT NOT NULL,
         population INTEGER NOT NULL,
@@ -75,10 +98,9 @@ export class DatabaseInitializer {
         infrastructure_avg REAL NOT NULL,
         violence_level INTEGER NOT NULL,
         net_force REAL NOT NULL,
-        PRIMARY KEY (round, hex_id)
+        PRIMARY KEY (run_id, round, hex_id)
       );
 
-      -- Events table: Log of what happened each round
       CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         round INTEGER NOT NULL,
@@ -88,22 +110,21 @@ export class DatabaseInitializer {
         impact_value REAL NOT NULL
       );
 
-      -- Indexes for performance
       CREATE INDEX IF NOT EXISTS idx_hexagons_type ON hexagons(type);
-      CREATE INDEX IF NOT EXISTS idx_history_round ON history(round);
+      CREATE INDEX IF NOT EXISTS idx_history_run_round ON history(run_id, round);
       CREATE INDEX IF NOT EXISTS idx_events_round ON events(round);
       CREATE INDEX IF NOT EXISTS idx_hexagons_grid ON hexagons(grid_x, grid_y);
     `);
-
-    console.log('✓ Database schema initialized');
   }
 
   /**
-   * Create initial 100 hexagons
-   * - First 20: Urban (40k people each)
-   * - Last 80: Rural (2.5k people each)
+   * Create the initial hexagons from config (first `urbanCount` are urban).
    */
   createInitialHexagons(): void {
+    const rng = new RNG(this.config.seed);
+    const { gridSize, urbanCount, urban, rural } = this.config.world;
+    const count = gridSize * gridSize;
+
     const stmt = this.db.prepare(`
       INSERT INTO hexagons (
         id, type, area_km2, population, food_stored_tons, food_production_per_month,
@@ -113,156 +134,118 @@ export class DatabaseInitializer {
     `);
 
     const insertMany = this.db.transaction((hexagons: any[]) => {
-      for (const hex of hexagons) {
+      for (const h of hexagons) {
         stmt.run(
-          hex.id,
-          hex.type,
-          hex.area_km2,
-          hex.population,
-          hex.food_stored_tons,
-          hex.food_production_per_month,
-          hex.water_availability,
-          hex.infrastructure_power,
-          hex.infrastructure_water,
-          hex.infrastructure_roads,
-          hex.violence_level,
-          hex.cohesion,
-          hex.farmland_pct,
-          hex.grid_x,
-          hex.grid_y
+          h.id, h.type, h.area_km2, h.population, h.food_stored_tons, h.food_production_per_month,
+          h.water_availability, h.infrastructure_power, h.infrastructure_water, h.infrastructure_roads,
+          h.violence_level, h.cohesion, h.farmland_pct, h.grid_x, h.grid_y
         );
       }
     });
 
     const hexagons: Partial<Hexagon>[] = [];
-    const gridSize = 10;
-
-    for (let i = 0; i < 100; i++) {
-      const hexId = `HEX_${String(i).padStart(3, '0')}`;
-      const isUrban = i < 20;
-      const gridX = i % gridSize;
-      const gridY = Math.floor(i / gridSize);
-
-      const hex: Partial<Hexagon> = {
-        id: hexId,
+    for (let i = 0; i < count; i++) {
+      const isUrban = i < urbanCount;
+      const t: HexTemplate = isUrban ? urban : rural;
+      hexagons.push({
+        id: `HEX_${String(i).padStart(3, '0')}`,
         type: isUrban ? 'urban' : 'rural',
-        area_km2: isUrban ? 10 : 50,
-        population: isUrban ? 40000 : 2500,
-        food_stored_tons: isUrban ? 200 : 50,
-        food_production_per_month: isUrban ? 0 : 25,
-        water_availability: 90 + Math.random() * 10, // 90-100%
-        infrastructure_power: 85 + Math.random() * 5, // 85-90%
-        infrastructure_water: 85 + Math.random() * 5,
-        infrastructure_roads: 85 + Math.random() * 5,
-        violence_level: 5, // Very low
-        cohesion: 75 + Math.random() * 10, // 75-85%
-        farmland_pct: isUrban ? 0 : 60 + Math.random() * 20, // Rural: 60-80%
-        grid_x: gridX,
-        grid_y: gridY,
-      };
-
-      hexagons.push(hex);
+        area_km2: t.areaKm2,
+        population: t.population,
+        food_stored_tons: t.foodStoredTons,
+        food_production_per_month: t.foodProductionPerMonth,
+        water_availability: rng.range(t.waterAvailability[0], t.waterAvailability[1]),
+        infrastructure_power: rng.range(t.infrastructure[0], t.infrastructure[1]),
+        infrastructure_water: rng.range(t.infrastructure[0], t.infrastructure[1]),
+        infrastructure_roads: rng.range(t.infrastructure[0], t.infrastructure[1]),
+        violence_level: t.violenceLevel,
+        cohesion: rng.range(t.cohesion[0], t.cohesion[1]),
+        farmland_pct: rng.range(t.farmlandPct[0], t.farmlandPct[1]),
+        grid_x: i % gridSize,
+        grid_y: Math.floor(i / gridSize),
+      });
     }
 
     insertMany(hexagons);
-    console.log('✓ Created 100 hexagons (20 urban, 80 rural)');
   }
 
   /**
-   * Create edges between adjacent hexagons
-   * 4-directional: up, down, left, right
+   * Create 4-directional edges between adjacent hexagons.
    */
   createEdges(): void {
-    const stmt = this.db.prepare(`
-      INSERT INTO edges (from_hex_id, to_hex_id, base_permeability)
-      VALUES (?, ?, ?)
-    `);
+    const rng = new RNG(this.config.seed ^ 0x55aa55aa);
+    const { gridSize, permeability } = this.config.world;
+    const count = gridSize * gridSize;
 
+    const stmt = this.db.prepare(
+      `INSERT INTO edges (from_hex_id, to_hex_id, base_permeability) VALUES (?, ?, ?)`
+    );
     const insertMany = this.db.transaction((edges: Edge[]) => {
-      for (const edge of edges) {
-        stmt.run(edge.from_hex_id, edge.to_hex_id, edge.base_permeability);
-      }
+      for (const e of edges) stmt.run(e.from_hex_id, e.to_hex_id, e.base_permeability);
     });
 
     const edges: Edge[] = [];
-    const gridSize = 10;
-
-    for (let i = 0; i < 100; i++) {
-      const hexId = `HEX_${String(i).padStart(3, '0')}`;
+    for (let i = 0; i < count; i++) {
       const x = i % gridSize;
       const y = Math.floor(i / gridSize);
-
-      // Helper to add bidirectional edge
-      const addEdge = (neighborX: number, neighborY: number) => {
-        if (neighborX >= 0 && neighborX < gridSize && neighborY >= 0 && neighborY < gridSize) {
-          const neighborIdx = neighborY * gridSize + neighborX;
-          const neighborId = `HEX_${String(neighborIdx).padStart(3, '0')}`;
-          const permeability = 0.8 + Math.random() * 0.2; // 0.8-1.0
-
-          edges.push({
-            from_hex_id: hexId,
-            to_hex_id: neighborId,
-            base_permeability: permeability,
-          });
-        }
+      const addEdge = (nx: number, ny: number) => {
+        if (nx < 0 || nx >= gridSize || ny < 0 || ny >= gridSize) return;
+        edges.push({
+          from_hex_id: `HEX_${String(i).padStart(3, '0')}`,
+          to_hex_id: `HEX_${String(ny * gridSize + nx).padStart(3, '0')}`,
+          base_permeability: rng.range(permeability[0], permeability[1]),
+        });
       };
-
-      // Create edges to: right, left, down, up
-      addEdge(x + 1, y); // Right
-      addEdge(x - 1, y); // Left
-      addEdge(x, y + 1); // Down
-      addEdge(x, y - 1); // Up
+      addEdge(x + 1, y);
+      addEdge(x - 1, y);
+      addEdge(x, y + 1);
+      addEdge(x, y - 1);
     }
 
     insertMany(edges);
-    console.log(`✓ Created ${edges.length} edges`);
   }
 
   /**
-   * Initialize game state at round 0
+   * Initialize game state at round 0.
    */
   initializeGameState(): void {
     const hexagons = this.db.prepare('SELECT * FROM hexagons').all() as Hexagon[];
-
     const totalPopulation = hexagons.reduce((sum, h) => sum + h.population, 0);
     const totalFood = hexagons.reduce((sum, h) => sum + h.food_stored_tons, 0);
 
-    this.db.prepare(`
-      INSERT INTO game_state (
-        id, current_round, total_population, total_food_tons,
-        total_deaths, deaths_starvation, deaths_transit
-      ) VALUES (1, 0, ?, ?, 0, 0, 0)
-    `).run(totalPopulation, totalFood);
-
-    console.log(`✓ Game state initialized: ${totalPopulation.toLocaleString()} people, ${totalFood.toFixed(0)} tons food`);
+    this.db
+      .prepare(
+        `INSERT INTO game_state (
+          id, run_id, current_round, total_population, total_food_tons,
+          total_deaths, deaths_starvation, deaths_transit
+        ) VALUES (1, ?, 0, ?, ?, 0, 0, 0)`
+      )
+      .run(this.runId, totalPopulation, totalFood);
   }
 
   /**
-   * Complete initialization: create schema + world
+   * Complete initialization: schema + world.
    */
   initialize(): void {
-    console.log('Initializing ABBADON Phase 1 database...\n');
-
     this.initializeDatabase();
     this.createInitialHexagons();
     this.createEdges();
     this.initializeGameState();
-
-    console.log('\n✓ Database initialization complete!');
+    console.log(`✓ World initialized (run ${this.runId})`);
   }
 
   /**
-   * Reset database (delete and recreate)
+   * Reset for a new run: clear the live world but KEEP history (namespaced by
+   * run_id) so prior runs can still be inspected. A fresh run_id is assigned.
    */
   reset(): void {
     this.db.exec(`
-      DROP TABLE IF EXISTS events;
-      DROP TABLE IF EXISTS history;
+      DELETE FROM events;
       DROP TABLE IF EXISTS game_state;
       DROP TABLE IF EXISTS edges;
       DROP TABLE IF EXISTS hexagons;
     `);
-    console.log('✓ Database reset');
+    this.runId = this.makeRunId();
   }
 
   close(): void {

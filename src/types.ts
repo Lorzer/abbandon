@@ -39,12 +39,33 @@ export interface Hexagon {
 
 export interface GameState {
   id: number;
+  run_id: string;
   current_round: number;
   total_population: number;
   total_food_tons: number;
   total_deaths: number;
   deaths_starvation: number;
   deaths_transit: number;
+}
+
+/** Per-hex breakdown of the force calculation, for inspection/tuning. */
+export interface ForceBreakdown {
+  hex_id: string;
+  attractors: {
+    food_surplus: number;
+    water: number;
+    infrastructure: number;
+  };
+  repulsors: {
+    food_shortage: number;
+    water_shortage: number;
+    overcrowding: number;
+    infrastructure_collapse: number;
+  };
+  security: number; // signed: positive = safe, negative = violent
+  attractor_total: number;
+  repulsor_total: number;
+  net: number;
 }
 
 export interface LLMDecision {
