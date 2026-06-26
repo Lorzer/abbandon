@@ -354,26 +354,60 @@ function gridSize() {
   return config ? config.world.gridSize : 10;
 }
 
+// Pointy-top hex layout in "odd-r" offset coords (matches the engine adjacency).
+let hexLayout = null; // { size, centers: Map<id, {cx, cy}> }
+
+function computeHexLayout() {
+  const gs = gridSize();
+  const S = canvas.width;
+  const sqrt3 = Math.sqrt(3);
+  const size = Math.min(S / (sqrt3 * (gs + 0.5)), canvas.height / (1.5 * gs + 0.5));
+  const hexWidth = sqrt3 * size;
+  const gridW = hexWidth * gs + hexWidth / 2;
+  const gridH = 1.5 * size * (gs - 1) + 2 * size;
+  const offX = (S - gridW) / 2;
+  const offY = (canvas.height - gridH) / 2;
+
+  const centers = new Map();
+  for (const hex of hexagons) {
+    const cx = offX + hexWidth * hex.grid_x + (hex.grid_y % 2 ? hexWidth / 2 : 0) + hexWidth / 2;
+    const cy = offY + 1.5 * size * hex.grid_y + size;
+    centers.set(hex.id, { cx, cy });
+  }
+  hexLayout = { size, centers };
+}
+
+function tracePointyHex(cx, cy, size) {
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const a = (Math.PI / 180) * (60 * i - 90);
+    const x = cx + size * Math.cos(a);
+    const y = cy + size * Math.sin(a);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
 function drawHexGrid() {
   if (!hexagons.length) return;
+  computeHexLayout();
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const gs = gridSize();
-  const hw = canvas.width / gs;
-  const hh = canvas.height / gs;
+  const { size, centers } = hexLayout;
 
   for (const hex of hexagons) {
-    const x = hex.grid_x * hw;
-    const y = hex.grid_y * hh;
+    const { cx, cy } = centers.get(hex.id);
+    tracePointyHex(cx, cy, size * 0.97);
     ctx.fillStyle = colorFor(hex, overlayMode);
-    ctx.fillRect(x, y, hw - 1, hh - 1);
-    ctx.strokeStyle = selectedHex && selectedHex.id === hex.id ? '#ffff00' : '#2a2a2a';
-    ctx.lineWidth = selectedHex && selectedHex.id === hex.id ? 3 : 1;
-    ctx.strokeRect(x, y, hw - 1, hh - 1);
+    ctx.fill();
+    const sel = selectedHex && selectedHex.id === hex.id;
+    ctx.strokeStyle = sel ? '#ffff00' : '#1f1f1f';
+    ctx.lineWidth = sel ? 3 : 1;
+    ctx.stroke();
     ctx.fillStyle = '#ffffff';
-    ctx.font = `${Math.max(9, hw / 9)}px sans-serif`;
+    ctx.font = `${Math.max(8, size / 2.6)}px sans-serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(formatPopulation(hex.population), x + hw / 2, y + hh / 2);
+    ctx.fillText(formatPopulation(hex.population), cx, cy);
   }
 }
 
@@ -427,14 +461,25 @@ function renderLegend() {
 }
 
 canvas.addEventListener('click', (event) => {
+  if (!hexLayout) return;
   const rect = canvas.getBoundingClientRect();
-  const gs = gridSize();
-  const gx = Math.floor(((event.clientX - rect.left) / canvas.width) * gs);
-  const gy = Math.floor(((event.clientY - rect.top) / canvas.height) * gs);
-  const hex = hexagons.find((h) => h.grid_x === gx && h.grid_y === gy);
-  if (hex) {
-    selectedHex = hex;
-    displayHexDetails(hex);
+  // Map display coords -> canvas coords (the canvas may be CSS-scaled).
+  const px = (event.clientX - rect.left) * (canvas.width / rect.width);
+  const py = (event.clientY - rect.top) * (canvas.height / rect.height);
+
+  let best = null;
+  let bestD = Infinity;
+  for (const hex of hexagons) {
+    const c = hexLayout.centers.get(hex.id);
+    const d = (c.cx - px) ** 2 + (c.cy - py) ** 2;
+    if (d < bestD) {
+      bestD = d;
+      best = hex;
+    }
+  }
+  if (best && Math.sqrt(bestD) <= hexLayout.size) {
+    selectedHex = best;
+    displayHexDetails(best);
     drawHexGrid();
   }
 });

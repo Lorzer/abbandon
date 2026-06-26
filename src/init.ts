@@ -10,6 +10,31 @@ import type { Hexagon, GameState, Edge } from './types.js';
 import type { SimConfig, HexTemplate } from './config.js';
 import { RNG } from './rng.js';
 
+/**
+ * The 6 neighbours of a hex in "odd-r" offset coordinates (pointy-top layout,
+ * odd rows shifted right). Returns offsets that may be off-grid; callers clamp.
+ */
+export function hexNeighbors(col: number, row: number): [number, number][] {
+  const odd = row % 2 !== 0;
+  return odd
+    ? [
+        [col + 1, row], // E
+        [col - 1, row], // W
+        [col, row - 1], // NW
+        [col + 1, row - 1], // NE
+        [col, row + 1], // SW
+        [col + 1, row + 1], // SE
+      ]
+    : [
+        [col + 1, row], // E
+        [col - 1, row], // W
+        [col - 1, row - 1], // NW
+        [col, row - 1], // NE
+        [col - 1, row + 1], // SW
+        [col, row + 1], // SE
+      ];
+}
+
 export class DatabaseInitializer {
   private db: Database.Database;
   private config: SimConfig;
@@ -170,7 +195,9 @@ export class DatabaseInitializer {
   }
 
   /**
-   * Create 4-directional edges between adjacent hexagons.
+   * Create edges between adjacent hexagons on a real hex grid: 6 neighbours per
+   * cell using "odd-r" offset coordinates (pointy-top, odd rows shifted right).
+   * This matches the canvas rendering, so migration spreads in 6 directions.
    */
   createEdges(): void {
     const rng = new RNG(this.config.seed ^ 0x55aa55aa);
@@ -196,10 +223,7 @@ export class DatabaseInitializer {
           base_permeability: rng.range(permeability[0], permeability[1]),
         });
       };
-      addEdge(x + 1, y);
-      addEdge(x - 1, y);
-      addEdge(x, y + 1);
-      addEdge(x, y - 1);
+      for (const [nx, ny] of hexNeighbors(x, y)) addEdge(nx, ny);
     }
 
     insertMany(edges);
