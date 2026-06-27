@@ -3,19 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ABBADON Phase 1 - Climate Collapse Simulation</title>
+    <title>ABBADON - Climate Collapse Simulation</title>
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <div class="container">
-      <!-- Left Panel: Controls & Info -->
+      <!-- Left Panel: Controls, Stats, Config -->
       <div class="left-panel">
         <header>
           <h1>ABBADON</h1>
-          <p class="subtitle">Phase 1 Prototype</p>
+          <p class="subtitle">Collapse Engine · Tuning Console</p>
         </header>
 
-        <!-- Controls -->
+        <!-- Transport -->
         <section class="controls">
           <h2>Controls</h2>
           <div class="button-group">
@@ -24,40 +24,46 @@
             <button id="stepBtn" class="btn">⏭ Step</button>
             <button id="resetBtn" class="btn btn-danger">🔄 Reset</button>
           </div>
-        </section>
-
-        <!-- Metrics -->
-        <section class="metrics">
-          <h2>Global Metrics</h2>
-          <div class="metric">
-            <span class="metric-label">Round:</span>
-            <span class="metric-value" id="metricRound">0</span>
-            <span class="metric-max">/ 60</span>
+          <div class="speed-row">
+            <label for="speed">Speed</label>
+            <input type="range" id="speed" min="1" max="10" step="1" value="1" />
+            <span id="speedValue" class="mono">1×</span>
           </div>
-          <div class="metric">
-            <span class="metric-label">Total Population:</span>
-            <span class="metric-value" id="metricPopulation">0</span>
-          </div>
-          <div class="metric">
-            <span class="metric-label">Urban Population:</span>
-            <span class="metric-value" id="metricUrbanPop">0</span>
-          </div>
-          <div class="metric">
-            <span class="metric-label">Rural Population:</span>
-            <span class="metric-value" id="metricRuralPop">0</span>
-          </div>
-          <div class="metric">
-            <span class="metric-label">Total Food:</span>
-            <span class="metric-value" id="metricFood">0</span>
-            <span class="metric-max">tons</span>
-          </div>
-          <div class="metric">
-            <span class="metric-label">Total Deaths:</span>
-            <span class="metric-value" id="metricDeaths">0</span>
+          <div class="rewind-row">
+            <label for="rewind">Rewind to round</label>
+            <input type="number" id="rewind" min="0" value="0" />
+            <button id="forkBtn" class="btn btn-small">⏮ Fork</button>
           </div>
         </section>
 
-        <!-- Selected Hex Details -->
+        <!-- Stats -->
+        <section class="stats">
+          <h2>Stats</h2>
+          <div id="statsContent"></div>
+          <div class="spark-wrap">
+            <div class="spark-label">Total population over time</div>
+            <canvas id="sparkline" height="60"></canvas>
+          </div>
+        </section>
+
+        <!-- Configuration -->
+        <section class="config">
+          <div class="config-head">
+            <h2>Configuration</h2>
+            <div class="config-actions">
+              <button id="revertBtn" class="btn btn-small">Revert</button>
+              <button id="applyBtn" class="btn btn-small btn-primary">Apply</button>
+            </div>
+          </div>
+          <p class="config-hint">
+            Tune the factors that shape the <em>pace and texture</em> of collapse. Fields marked
+            <span class="reinit-tag">world</span> regenerate the map on apply; others take effect
+            on the next round.
+          </p>
+          <div id="configContent"></div>
+        </section>
+
+        <!-- Selected Hex -->
         <section class="hex-details">
           <h2>Selected Hex</h2>
           <div id="hexDetailsContent" class="hex-details-content">
@@ -74,35 +80,22 @@
 
       <!-- Right Panel: Hex Grid Visualization -->
       <div class="right-panel">
+        <div class="map-toolbar">
+          <label for="overlay">Color by</label>
+          <select id="overlay">
+            <option value="population">Population</option>
+            <option value="net_force">Net force</option>
+            <option value="food">Food (months)</option>
+            <option value="water">Water</option>
+            <option value="infrastructure">Infrastructure</option>
+          </select>
+        </div>
         <div class="canvas-container">
           <canvas id="hexCanvas"></canvas>
         </div>
-
-        <!-- Legend -->
         <div class="legend">
-          <h3>Population Density</h3>
-          <div class="legend-items">
-            <div class="legend-item">
-              <span class="legend-color" style="background: #2d5016"></span>
-              <span>Low (&lt;5k)</span>
-            </div>
-            <div class="legend-item">
-              <span class="legend-color" style="background: #4a7c1e"></span>
-              <span>Medium (5k-15k)</span>
-            </div>
-            <div class="legend-item">
-              <span class="legend-color" style="background: #d17a22"></span>
-              <span>High (15k-30k)</span>
-            </div>
-            <div class="legend-item">
-              <span class="legend-color" style="background: #c0392b"></span>
-              <span>Very High (30k+)</span>
-            </div>
-            <div class="legend-item">
-              <span class="legend-color" style="background: #1a1a1a"></span>
-              <span>Depleted (&lt;100)</span>
-            </div>
-          </div>
+          <h3 id="legendTitle">Population Density</h3>
+          <div class="legend-items" id="legendItems"></div>
         </div>
       </div>
     </div>

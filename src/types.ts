@@ -2,6 +2,21 @@
  * ABBADON Phase 1 - Type Definitions
  */
 
+import type { SimConfig } from './config.js';
+
+/**
+ * The complete in-memory simulation state. The engine operates on this object
+ * directly (no database); persistence (Supabase) loads and saves it.
+ */
+export interface WorldState {
+  config: SimConfig;
+  gameState: GameState;
+  hexagons: Hexagon[];
+  edges: Edge[];
+  history: HexSnapshot[];
+  events: EventLog[];
+}
+
 export interface Hexagon {
   id: string;
   type: 'urban' | 'rural';
@@ -39,12 +54,33 @@ export interface Hexagon {
 
 export interface GameState {
   id: number;
+  run_id: string;
   current_round: number;
   total_population: number;
   total_food_tons: number;
   total_deaths: number;
   deaths_starvation: number;
   deaths_transit: number;
+}
+
+/** Per-hex breakdown of the force calculation, for inspection/tuning. */
+export interface ForceBreakdown {
+  hex_id: string;
+  attractors: {
+    food_surplus: number;
+    water: number;
+    infrastructure: number;
+  };
+  repulsors: {
+    food_shortage: number;
+    water_shortage: number;
+    overcrowding: number;
+    infrastructure_collapse: number;
+  };
+  security: number; // signed: positive = safe, negative = violent
+  attractor_total: number;
+  repulsor_total: number;
+  net: number;
 }
 
 export interface LLMDecision {

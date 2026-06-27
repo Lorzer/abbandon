@@ -1,532 +1,399 @@
 /**
- * ABBADON Phase 1 - Simulation Engine
+ * ABBADON - Simulation Engine (in-memory)
+ *
+ * Operates directly on a WorldState object (no database). All tunable factors
+ * are read from SimConfig. The force model computes each term as a normalized
+ * 0-100 intensity times a configurable weight, so the pace and spatial texture
+ * of collapse can be tuned without editing engine code.
  */
 
-import Database from 'better-sqlite3';
 import type {
   Hexagon,
   GameState,
   LLMDecision,
-  Forces,
-  PopulationFlow,
   Edge,
   HexSnapshot,
   EventLog,
+  ForceBreakdown,
+  WorldState,
 } from './types.js';
-import type { LLMDirector } from './llm.js';
+import type { Director } from './director.js';
+import type { SimConfig } from './config.js';
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
 
 export class SimulationEngine {
-  private db: Database.Database;
+  private state: WorldState;
+  private config: SimConfig;
+  private index: Map<string, Hexagon>;
 
-  constructor(db: Database.Database) {
-    this.db = db;
+  constructor(state: WorldState) {
+    this.state = state;
+    this.config = state.config;
+    this.index = new Map(state.hexagons.map((h) => [h.id, h]));
+  }
+
+  getState(): WorldState {
+    return this.state;
+  }
+
+  setConfig(config: SimConfig): void {
+    this.config = config;
+    this.state.config = config;
+  }
+
+  getConfig(): SimConfig {
+    return this.config;
   }
 
   /**
-   * Run a single simulation round
+   * Run a single simulation round.
    */
-  async runRound(llmDirector: LLMDirector): Promise<GameState> {
-    const gameState = this.getGameState();
-    const currentRound = gameState.current_round + 1;
+  async runRound(director: Director): Promise<GameState> {
+    const gs = this.state.gameState;
+    const currentRound = gs.current_round + 1;
+    const populationBefore = this.totalPopulation();
 
-    console.log(`\n=== ROUND ${currentRound} ===`);
+    const decision = await director.getDecision(currentRound, this.state);
 
-    // 1. Get LLM decision
-    const llmDecision = await llmDirector.getDecision(currentRound, this.db);
-    console.log(`Weather: ${llmDecision.weather} (severity ${llmDecision.weather_severity})`);
-    console.log(`Narrative: ${llmDecision.narrative}`);
-
-    // 2. Apply weather effects (global)
-    this.applyWeatherEffects(llmDecision);
-
-    // 3. Apply triggered events (specific hexes)
-    this.applyTriggeredEvents(llmDecision, currentRound);
-
-    // 4. Apply infrastructure decay
-    this.applyInfrastructureDecay(llmDecision.infrastructure_decay_multiplier);
-
-    // 5. Calculate forces for all hexes
+    this.applyWeatherEffects(decision);
+    const diseaseDeaths = this.applyTriggeredEvents(decision, currentRound);
+    this.applyInfrastructureDecay(decision.infrastructure_decay_multiplier);
     this.calculateAllForces();
-
-    // 6. Execute population flows
-    const totalFlows = this.executePopulationFlows();
-    console.log(`Population flows: ${totalFlows} people moved`);
-
-    // 7. Consume resources
+    const { transitDeaths } = this.executePopulationFlows();
     this.consumeResources();
-
-    // 8. Produce resources
-    this.produceResources();
-
-    // 9. Apply starvation
+    this.produceResources(currentRound);
     const starvationDeaths = this.applyStarvation();
-    console.log(`Starvation deaths: ${starvationDeaths}`);
 
-    // 10. Update game state
-    const newGameState = this.updateGameState(currentRound, starvationDeaths, 0);
+    this.updateGameState(currentRound, starvationDeaths, transitDeaths, diseaseDeaths);
 
-    // 11. Save history snapshot
+    // Invariant: population must reconcile against deaths.
+    const drift = populationBefore - (starvationDeaths + transitDeaths + diseaseDeaths) - this.totalPopulation();
+    if (drift !== 0) {
+      console.warn(`⚠ Population conservation drift on round ${currentRound}: drift=${drift}`);
+    }
+
     this.saveHistorySnapshot(currentRound);
+    this.logEvent(currentRound, null, 'narrative', decision.narrative, decision.weather_severity);
 
-    // 12. Log narrative event
-    this.logEvent(currentRound, null, 'narrative', llmDecision.narrative, llmDecision.weather_severity);
-
-    return newGameState;
+    return this.state.gameState;
   }
 
-  /**
-   * Apply global weather effects to all hexagons
-   */
   private applyWeatherEffects(decision: LLMDecision): void {
     const { water_impact, food_impact, infrastructure_impact } = decision.weather_effects;
-
-    this.db.prepare(`
-      UPDATE hexagons SET
-        water_availability = MAX(0, MIN(100, water_availability + ?)),
-        food_stored_tons = MAX(0, food_stored_tons * (1 + ? / 100)),
-        infrastructure_power = MAX(0, MIN(100, infrastructure_power + ?)),
-        infrastructure_water = MAX(0, MIN(100, infrastructure_water + ?)),
-        infrastructure_roads = MAX(0, MIN(100, infrastructure_roads + ?))
-    `).run(
-      water_impact,
-      food_impact,
-      infrastructure_impact,
-      infrastructure_impact,
-      infrastructure_impact
-    );
+    for (const h of this.state.hexagons) {
+      h.water_availability = clamp(h.water_availability + water_impact, 0, 100);
+      h.food_stored_tons = Math.max(0, h.food_stored_tons * (1 + food_impact / 100));
+      h.infrastructure_power = clamp(h.infrastructure_power + infrastructure_impact, 0, 100);
+      h.infrastructure_water = clamp(h.infrastructure_water + infrastructure_impact, 0, 100);
+      h.infrastructure_roads = clamp(h.infrastructure_roads + infrastructure_impact, 0, 100);
+    }
   }
 
-  /**
-   * Apply triggered events to specific hexagons
-   */
-  private applyTriggeredEvents(decision: LLMDecision, round: number): void {
+  /** Returns disease deaths so they can be counted in the global tally. */
+  private applyTriggeredEvents(decision: LLMDecision, round: number): number {
+    let diseaseDeaths = 0;
     for (const event of decision.triggered_events) {
-      const hex = this.getHexagon(event.hex_id);
+      const hex = this.index.get(event.hex_id);
       if (!hex) continue;
 
       switch (event.event_type) {
         case 'violence':
-          this.db.prepare(`
-            UPDATE hexagons SET
-              violence_level = MIN(10, violence_level + ?),
-              cohesion = MAX(0, cohesion - ?)
-            WHERE id = ?
-          `).run(event.severity / 2, event.severity * 5, event.hex_id);
+          hex.violence_level = Math.min(10, hex.violence_level + event.severity / 2);
+          hex.cohesion = Math.max(0, hex.cohesion - event.severity * 5);
           break;
-
-        case 'disease':
+        case 'disease': {
           const deaths = Math.floor(hex.population * (event.severity / 100));
-          this.db.prepare(`
-            UPDATE hexagons SET population = MAX(0, population - ?)
-            WHERE id = ?
-          `).run(deaths, event.hex_id);
+          hex.population = Math.max(0, hex.population - deaths);
+          diseaseDeaths += deaths;
           this.logEvent(round, event.hex_id, 'disease', event.reason, deaths);
           break;
-
+        }
         case 'infrastructure_collapse':
-          this.db.prepare(`
-            UPDATE hexagons SET
-              infrastructure_power = MAX(0, infrastructure_power - ?),
-              infrastructure_water = MAX(0, infrastructure_water - ?),
-              infrastructure_roads = MAX(0, infrastructure_roads - ?)
-            WHERE id = ?
-          `).run(event.severity * 10, event.severity * 10, event.severity * 10, event.hex_id);
+          hex.infrastructure_power = Math.max(0, hex.infrastructure_power - event.severity * 10);
+          hex.infrastructure_water = Math.max(0, hex.infrastructure_water - event.severity * 10);
+          hex.infrastructure_roads = Math.max(0, hex.infrastructure_roads - event.severity * 10);
           break;
-
         case 'resource_discovery':
-          this.db.prepare(`
-            UPDATE hexagons SET food_stored_tons = food_stored_tons + ?
-            WHERE id = ?
-          `).run(event.severity * 10, event.hex_id);
+          hex.food_stored_tons += event.severity * 10;
           break;
       }
-
       this.logEvent(round, event.hex_id, event.event_type, event.reason, event.severity);
     }
+    return diseaseDeaths;
   }
 
-  /**
-   * Apply infrastructure decay (increases over time)
-   */
   private applyInfrastructureDecay(multiplier: number): void {
-    const baseDecay = 0.5; // 0.5% per month
-    const decay = baseDecay * multiplier;
-
-    this.db.prepare(`
-      UPDATE hexagons SET
-        infrastructure_power = MAX(0, infrastructure_power - ?),
-        infrastructure_water = MAX(0, infrastructure_water - ?),
-        infrastructure_roads = MAX(0, infrastructure_roads - ?)
-    `).run(decay, decay, decay);
+    const decay = this.config.decay.baseInfraPct * multiplier;
+    for (const h of this.state.hexagons) {
+      h.infrastructure_power = Math.max(0, h.infrastructure_power - decay);
+      h.infrastructure_water = Math.max(0, h.infrastructure_water - decay);
+      h.infrastructure_roads = Math.max(0, h.infrastructure_roads - decay);
+    }
   }
 
-  /**
-   * Calculate forces (attractors vs repulsors) for all hexagons
-   */
   private calculateAllForces(): void {
-    const hexagons = this.db.prepare('SELECT * FROM hexagons').all() as Hexagon[];
-
-    const updateStmt = this.db.prepare(`
-      UPDATE hexagons SET
-        attractor_force = ?,
-        repulsor_force = ?,
-        net_force = ?
-      WHERE id = ?
-    `);
-
-    const updateMany = this.db.transaction((updates: any[]) => {
-      for (const u of updates) {
-        updateStmt.run(u.attractor, u.repulsor, u.net, u.id);
-      }
-    });
-
-    const updates = hexagons.map((hex) => {
-      const forces = this.calculateHexForces(hex);
-      return {
-        id: hex.id,
-        attractor: forces.attractors.food_surplus + forces.attractors.water_availability +
-                   forces.attractors.infrastructure_quality + forces.attractors.safety,
-        repulsor: forces.repulsors.food_shortage + forces.repulsors.water_shortage +
-                  forces.repulsors.violence + forces.repulsors.overcrowding +
-                  forces.repulsors.infrastructure_collapse,
-        net: forces.net,
-      };
-    });
-
-    updateMany(updates);
+    for (const hex of this.state.hexagons) {
+      const b = this.calculateHexForces(hex);
+      hex.attractor_force = b.attractor_total;
+      hex.repulsor_force = b.repulsor_total;
+      hex.net_force = b.net;
+    }
   }
 
   /**
-   * Calculate forces for a single hexagon
+   * Force breakdown for a single hex. Each term is a normalized 0-100 intensity
+   * times its configured weight.
    */
-  private calculateHexForces(hex: Hexagon): Forces {
-    const forces: Forces = {
-      attractors: {
-        food_surplus: 0,
-        water_availability: 0,
-        infrastructure_quality: 0,
-        safety: 0,
-      },
+  calculateHexForces(hex: Hexagon): ForceBreakdown {
+    const f = this.config.forces;
+    const { perCapitaTonsPerMonth } = this.config.consumption;
+
+    const foodPerCapita =
+      hex.population > 0 ? hex.food_stored_tons / (hex.population * perCapitaTonsPerMonth) : 999;
+    const avgInfra =
+      (hex.infrastructure_power + hex.infrastructure_water + hex.infrastructure_roads) / 3;
+    const density = hex.area_km2 > 0 ? hex.population / hex.area_km2 : 0;
+    const overcrowdingDensity = this.overcrowdingDensityFor(hex.type);
+
+    const foodSurplus =
+      f.foodSurplus.weight *
+      clamp((foodPerCapita - f.foodSurplus.thresholdMonths) / f.foodSurplus.spanMonths, 0, 1) * 100;
+    const water = f.waterAttract.weight * clamp(hex.water_availability, 0, 100);
+    const infrastructure = f.infraAttract.weight * clamp(avgInfra, 0, 100);
+
+    const securityNorm = clamp(
+      (f.security.neutralViolence - hex.violence_level) / f.security.neutralViolence, -1, 1
+    );
+    const security = f.security.weight * securityNorm * 100;
+
+    const foodShortage =
+      f.foodShortage.weight *
+      clamp((f.foodShortage.thresholdMonths - foodPerCapita) / f.foodShortage.thresholdMonths, 0, 1) * 100;
+    const waterShortage =
+      f.waterShortage.weight *
+      clamp((f.waterShortage.thresholdPct - hex.water_availability) / f.waterShortage.thresholdPct, 0, 1) * 100;
+    const overcrowding =
+      f.overcrowding.weight * clamp((density - overcrowdingDensity) / overcrowdingDensity, 0, 1) * 100;
+    const infrastructureCollapse =
+      f.infraCollapse.weight *
+      clamp((f.infraCollapse.thresholdPct - avgInfra) / f.infraCollapse.thresholdPct, 0, 1) * 100;
+
+    const attractorTotal = foodSurplus + water + infrastructure + Math.max(0, security);
+    const repulsorTotal =
+      foodShortage + waterShortage + overcrowding + infrastructureCollapse + Math.max(0, -security);
+
+    return {
+      hex_id: hex.id,
+      attractors: { food_surplus: foodSurplus, water, infrastructure },
       repulsors: {
-        food_shortage: 0,
-        water_shortage: 0,
-        violence: 0,
-        overcrowding: 0,
-        infrastructure_collapse: 0,
+        food_shortage: foodShortage,
+        water_shortage: waterShortage,
+        overcrowding,
+        infrastructure_collapse: infrastructureCollapse,
       },
-      net: 0,
+      security,
+      attractor_total: attractorTotal,
+      repulsor_total: repulsorTotal,
+      net: attractorTotal - repulsorTotal,
     };
+  }
 
-    // Attractors
-    const foodPerCapita = hex.population > 0 ? hex.food_stored_tons / (hex.population * 0.002) : 0; // Months of food
-    if (foodPerCapita > 3) {
-      forces.attractors.food_surplus = Math.min(50, (foodPerCapita - 3) * 10);
-    }
-
-    forces.attractors.water_availability = hex.water_availability / 2;
-    forces.attractors.infrastructure_quality = (hex.infrastructure_power + hex.infrastructure_water + hex.infrastructure_roads) / 6;
-    forces.attractors.safety = (10 - hex.violence_level) * 5;
-
-    // Repulsors
-    if (foodPerCapita < 1) {
-      forces.repulsors.food_shortage = (1 - foodPerCapita) * 100;
-    }
-
-    if (hex.water_availability < 50) {
-      forces.repulsors.water_shortage = (50 - hex.water_availability) * 2;
-    }
-
-    forces.repulsors.violence = hex.violence_level * 10;
-
-    const density = hex.population / hex.area_km2;
-    const overcrowdingThreshold = hex.type === 'urban' ? 5000 : 100;
-    if (density > overcrowdingThreshold) {
-      forces.repulsors.overcrowding = Math.min(100, (density - overcrowdingThreshold) / overcrowdingThreshold * 50);
-    }
-
-    const avgInfra = (hex.infrastructure_power + hex.infrastructure_water + hex.infrastructure_roads) / 3;
-    if (avgInfra < 30) {
-      forces.repulsors.infrastructure_collapse = (30 - avgInfra) * 3;
-    }
-
-    // Net force
-    const totalAttractors = Object.values(forces.attractors).reduce((a, b) => a + b, 0);
-    const totalRepulsors = Object.values(forces.repulsors).reduce((a, b) => a + b, 0);
-    forces.net = totalAttractors - totalRepulsors;
-
-    return forces;
+  private overcrowdingDensityFor(type: 'urban' | 'rural'): number {
+    return type === 'urban'
+      ? this.config.world.urban.overcrowdingDensity
+      : this.config.world.rural.overcrowdingDensity;
   }
 
   /**
-   * Execute population flows between hexagons
+   * Population flows between hexes. Returns total moved and transit deaths
+   * (mortality rises as roads degrade).
    */
-  private executePopulationFlows(): number {
-    const hexagons = this.db.prepare('SELECT * FROM hexagons').all() as Hexagon[];
-    const edges = this.db.prepare('SELECT * FROM edges').all() as Edge[];
-
-    const flows: PopulationFlow[] = [];
+  private executePopulationFlows(): { totalMoved: number; transitDeaths: number } {
+    const { leaveNetThreshold, maxLeavePct, leaveScale, transitMortality } = this.config.migration;
+    const flows: { from: Hexagon; to: Hexagon; moved: number; deaths: number }[] = [];
     let totalMoved = 0;
+    let transitDeaths = 0;
 
-    // Find hexes with negative force (people want to leave)
-    for (const hex of hexagons) {
-      if (hex.net_force < -20 && hex.population > 0) {
-        // Calculate how many want to leave
-        const leavePercentage = Math.min(0.2, Math.abs(hex.net_force) / 500); // Max 20% per month
-        const leavingPopulation = Math.floor(hex.population * leavePercentage);
+    for (const hex of this.state.hexagons) {
+      if (hex.net_force >= leaveNetThreshold || hex.population <= 0) continue;
 
-        if (leavingPopulation === 0) continue;
+      const leavePercentage = Math.min(maxLeavePct, Math.abs(hex.net_force) / leaveScale);
+      const leavingPopulation = Math.floor(hex.population * leavePercentage);
+      if (leavingPopulation === 0) continue;
 
-        // Find neighbors
-        const neighborEdges = edges.filter((e) => e.from_hex_id === hex.id);
-        const neighbors = neighborEdges
-          .map((e) => ({
-            hex: hexagons.find((h) => h.id === e.to_hex_id)!,
-            edge: e,
-          }))
-          .filter((n) => n.hex && n.hex.net_force > hex.net_force);
+      const neighbors = this.state.edges
+        .filter((e) => e.from_hex_id === hex.id)
+        .map((e) => ({ hex: this.index.get(e.to_hex_id)!, edge: e }))
+        .filter((n) => n.hex && n.hex.net_force > hex.net_force);
+      if (neighbors.length === 0) continue;
 
-        if (neighbors.length === 0) continue;
+      const withPerm = neighbors.map((n) => ({
+        ...n,
+        permeability: this.calculateEdgePermeability(hex, n.hex, n.edge),
+      }));
+      const totalPermeability = withPerm.reduce((sum, n) => sum + n.permeability, 0);
+      if (totalPermeability === 0) continue;
 
-        // Calculate permeability for each neighbor
-        const neighborsWithPermeability = neighbors.map((n) => ({
-          ...n,
-          permeability: this.calculateEdgePermeability(hex, n.hex, n.edge),
-        }));
+      for (const neighbor of withPerm) {
+        const share = neighbor.permeability / totalPermeability;
+        const moving = Math.floor(leavingPopulation * share);
+        if (moving <= 0) continue;
 
-        const totalPermeability = neighborsWithPermeability.reduce((sum, n) => sum + n.permeability, 0);
+        const avgRoads = (hex.infrastructure_roads + neighbor.hex.infrastructure_roads) / 2;
+        const mortalityRate = transitMortality * (1 - clamp(avgRoads, 0, 100) / 100);
+        const deaths = Math.floor(moving * mortalityRate);
 
-        if (totalPermeability === 0) continue;
-
-        // Distribute leaving population to neighbors
-        for (const neighbor of neighborsWithPermeability) {
-          const share = neighbor.permeability / totalPermeability;
-          const movingPopulation = Math.floor(leavingPopulation * share);
-
-          if (movingPopulation > 0) {
-            flows.push({
-              from_hex_id: hex.id,
-              to_hex_id: neighbor.hex.id,
-              population_count: movingPopulation,
-              permeability: neighbor.permeability,
-            });
-            totalMoved += movingPopulation;
-          }
-        }
+        flows.push({ from: hex, to: neighbor.hex, moved: moving, deaths });
+        totalMoved += moving;
+        transitDeaths += deaths;
       }
     }
 
-    // Apply flows
-    const updateStmt = this.db.prepare('UPDATE hexagons SET population = population + ? WHERE id = ?');
-    const applyFlows = this.db.transaction((flowList: PopulationFlow[]) => {
-      for (const flow of flowList) {
-        updateStmt.run(-flow.population_count, flow.from_hex_id); // Remove from source
-        updateStmt.run(flow.population_count, flow.to_hex_id); // Add to destination
-      }
-    });
+    for (const flow of flows) {
+      flow.from.population -= flow.moved; // everyone leaves the source
+      flow.to.population += flow.moved - flow.deaths; // only survivors arrive
+    }
 
-    applyFlows(flows);
-
-    return totalMoved;
+    return { totalMoved, transitDeaths };
   }
 
-  /**
-   * Calculate edge permeability (how easily people can move)
-   */
   private calculateEdgePermeability(fromHex: Hexagon, toHex: Hexagon, edge: Edge): number {
     let permeability = edge.base_permeability;
-
-    // Roads help movement
     const avgRoads = (fromHex.infrastructure_roads + toHex.infrastructure_roads) / 2;
     permeability *= avgRoads / 100;
-
-    // Violence reduces movement
-    if (toHex.violence_level > 6) {
-      permeability *= 0.5;
-    }
-
-    // Don't overcrowd destination
-    const destDensity = toHex.population / toHex.area_km2;
-    const maxDensity = toHex.type === 'urban' ? 6000 : 150;
-    if (destDensity > maxDensity) {
-      permeability *= 0.3;
-    }
-
+    if (toHex.violence_level > 6) permeability *= 0.5;
+    const destDensity = toHex.area_km2 > 0 ? toHex.population / toHex.area_km2 : 0;
+    const maxDensity = this.overcrowdingDensityFor(toHex.type) * 1.2;
+    if (destDensity > maxDensity) permeability *= 0.3;
     return permeability;
   }
 
-  /**
-   * Consume resources (everyone needs food)
-   */
   private consumeResources(): void {
-    const hexagons = this.db.prepare('SELECT * FROM hexagons').all() as Hexagon[];
-
-    const updateStmt = this.db.prepare('UPDATE hexagons SET food_stored_tons = ? WHERE id = ?');
-
-    const updates = this.db.transaction((hexList: Hexagon[]) => {
-      for (const hex of hexList) {
-        const foodNeeded = hex.population * 0.002; // 2kg per person per month
-        const newFood = Math.max(0, hex.food_stored_tons - foodNeeded);
-        updateStmt.run(newFood, hex.id);
-      }
-    });
-
-    updates(hexagons);
+    const perCapita = this.config.consumption.perCapitaTonsPerMonth;
+    for (const h of this.state.hexagons) {
+      h.food_stored_tons = Math.max(0, h.food_stored_tons - h.population * perCapita);
+    }
   }
 
   /**
-   * Produce resources (rural hexes produce food)
+   * Rural farming plus decaying urban "supply line" imports that give cities a
+   * survivable window before they collapse.
    */
-  private produceResources(): void {
-    const hexagons = this.db.prepare('SELECT * FROM hexagons WHERE type = "rural"').all() as Hexagon[];
+  private produceResources(round: number): void {
+    const { farmersNeeded, urbanBaselineSupplyTons, urbanBaselineSupplyDecay } = this.config.production;
+    const urbanSupply = urbanBaselineSupplyTons * Math.pow(urbanBaselineSupplyDecay, round - 1);
 
-    const updateStmt = this.db.prepare('UPDATE hexagons SET food_stored_tons = food_stored_tons + ? WHERE id = ?');
-
-    const updates = this.db.transaction((hexList: Hexagon[]) => {
-      for (const hex of hexList) {
-        // Production depends on: base production × infrastructure × farmers present
-        const avgInfra = (hex.infrastructure_power + hex.infrastructure_water) / 200; // 0-1
-        const farmersNeeded = 100; // Arbitrary: need 100 people to work the land
-        const laborFactor = Math.min(1, hex.population / farmersNeeded);
-
-        const production = hex.food_production_per_month * avgInfra * laborFactor;
-        updateStmt.run(production, hex.id);
+    for (const h of this.state.hexagons) {
+      if (h.type === 'rural') {
+        const avgInfra = (h.infrastructure_power + h.infrastructure_water) / 200; // 0-1
+        const laborFactor = Math.min(1, h.population / farmersNeeded);
+        h.food_stored_tons += h.food_production_per_month * avgInfra * laborFactor;
+      } else {
+        h.food_stored_tons += urbanSupply;
       }
-    });
-
-    updates(hexagons);
+    }
   }
 
-  /**
-   * Apply starvation to hexes with no food
-   */
   private applyStarvation(): number {
-    const hexagons = this.db.prepare('SELECT * FROM hexagons WHERE food_stored_tons < 0.1').all() as Hexagon[];
-
+    const threshold = this.config.starvation.foodThresholdTons;
+    const rate = this.config.starvation.deathRate;
     let totalDeaths = 0;
-
-    const updateStmt = this.db.prepare('UPDATE hexagons SET population = ? WHERE id = ?');
-
-    const updates = this.db.transaction((hexList: Hexagon[]) => {
-      for (const hex of hexList) {
-        const deaths = Math.floor(hex.population * 0.1); // 10% death rate
-        const newPopulation = Math.max(0, hex.population - deaths);
-        totalDeaths += deaths;
-        updateStmt.run(newPopulation, hex.id);
-      }
-    });
-
-    updates(hexagons);
-
+    for (const h of this.state.hexagons) {
+      if (h.food_stored_tons >= threshold) continue;
+      const deaths = Math.floor(h.population * rate);
+      h.population = Math.max(0, h.population - deaths);
+      totalDeaths += deaths;
+    }
     return totalDeaths;
   }
 
-  /**
-   * Update game state
-   */
-  private updateGameState(round: number, starvationDeaths: number, transitDeaths: number): GameState {
-    const hexagons = this.db.prepare('SELECT * FROM hexagons').all() as Hexagon[];
-
-    const totalPopulation = hexagons.reduce((sum, h) => sum + h.population, 0);
-    const totalFood = hexagons.reduce((sum, h) => sum + h.food_stored_tons, 0);
-
-    const currentState = this.getGameState();
-    const newDeaths = currentState.total_deaths + starvationDeaths + transitDeaths;
-    const newStarvationDeaths = currentState.deaths_starvation + starvationDeaths;
-    const newTransitDeaths = currentState.deaths_transit + transitDeaths;
-
-    this.db.prepare(`
-      UPDATE game_state SET
-        current_round = ?,
-        total_population = ?,
-        total_food_tons = ?,
-        total_deaths = ?,
-        deaths_starvation = ?,
-        deaths_transit = ?
-      WHERE id = 1
-    `).run(round, totalPopulation, totalFood, newDeaths, newStarvationDeaths, newTransitDeaths);
-
-    return this.getGameState();
+  private updateGameState(round: number, starvationDeaths: number, transitDeaths: number, otherDeaths: number): void {
+    const gs = this.state.gameState;
+    gs.current_round = round;
+    gs.total_population = this.totalPopulation();
+    gs.total_food_tons = this.state.hexagons.reduce((sum, h) => sum + h.food_stored_tons, 0);
+    gs.total_deaths += starvationDeaths + transitDeaths + otherDeaths;
+    gs.deaths_starvation += starvationDeaths;
+    gs.deaths_transit += transitDeaths;
   }
 
-  /**
-   * Save history snapshot
-   */
   private saveHistorySnapshot(round: number): void {
-    const hexagons = this.db.prepare('SELECT * FROM hexagons').all() as Hexagon[];
-
-    const stmt = this.db.prepare(`
-      INSERT INTO history (
-        round, hex_id, population, food_stored_tons, water_availability,
-        infrastructure_avg, violence_level, net_force
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    const insertMany = this.db.transaction((snapshots: HexSnapshot[]) => {
-      for (const snap of snapshots) {
-        stmt.run(
-          snap.round,
-          snap.hex_id,
-          snap.population,
-          snap.food_stored_tons,
-          snap.water_availability,
-          snap.infrastructure_avg,
-          snap.violence_level,
-          snap.net_force
-        );
-      }
-    });
-
-    const snapshots: HexSnapshot[] = hexagons.map((hex) => ({
-      round,
-      hex_id: hex.id,
-      population: hex.population,
-      food_stored_tons: hex.food_stored_tons,
-      water_availability: hex.water_availability,
-      infrastructure_avg: (hex.infrastructure_power + hex.infrastructure_water + hex.infrastructure_roads) / 3,
-      violence_level: hex.violence_level,
-      net_force: hex.net_force,
-    }));
-
-    insertMany(snapshots);
+    for (const hex of this.state.hexagons) {
+      this.state.history.push({
+        round,
+        hex_id: hex.id,
+        population: hex.population,
+        food_stored_tons: hex.food_stored_tons,
+        water_availability: hex.water_availability,
+        infrastructure_avg:
+          (hex.infrastructure_power + hex.infrastructure_water + hex.infrastructure_roads) / 3,
+        violence_level: hex.violence_level,
+        net_force: hex.net_force,
+      });
+    }
   }
 
   /**
-   * Log event
+   * Restore hex state from a recorded round and truncate history/events after
+   * it. Used by "fork" to re-simulate forward.
    */
-  private logEvent(round: number, hexId: string | null, eventType: string, description: string, impactValue: number): void {
-    this.db.prepare(`
-      INSERT INTO events (round, hex_id, event_type, description, impact_value)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(round, hexId, eventType, description, impactValue);
+  forkFromRound(round: number): GameState {
+    const snaps = this.state.history.filter((s) => s.round === round);
+    if (snaps.length === 0) throw new Error(`No history snapshot for round ${round}`);
+
+    for (const s of snaps) {
+      const hex = this.index.get(s.hex_id);
+      if (!hex) continue;
+      hex.population = s.population;
+      hex.food_stored_tons = s.food_stored_tons;
+      hex.water_availability = s.water_availability;
+      hex.net_force = s.net_force;
+    }
+
+    this.state.history = this.state.history.filter((s) => s.round <= round);
+    this.state.events = this.state.events.filter((e) => e.round <= round);
+
+    const gs = this.state.gameState;
+    gs.current_round = round;
+    gs.total_population = this.totalPopulation();
+    gs.total_food_tons = this.state.hexagons.reduce((sum, h) => sum + h.food_stored_tons, 0);
+    return gs;
   }
 
-  /**
-   * Get current game state
-   */
+  private logEvent(
+    round: number,
+    hexId: string | null,
+    eventType: string,
+    description: string,
+    impactValue: number
+  ): void {
+    this.state.events.push({ round, hex_id: hexId, event_type: eventType, description, impact_value: impactValue });
+  }
+
+  private totalPopulation(): number {
+    return this.state.hexagons.reduce((sum, h) => sum + h.population, 0);
+  }
+
+  // --- accessors ---
   getGameState(): GameState {
-    return this.db.prepare('SELECT * FROM game_state WHERE id = 1').get() as GameState;
+    return this.state.gameState;
   }
-
-  /**
-   * Get hexagon by ID
-   */
   getHexagon(id: string): Hexagon | undefined {
-    return this.db.prepare('SELECT * FROM hexagons WHERE id = ?').get(id) as Hexagon | undefined;
+    return this.index.get(id);
   }
-
-  /**
-   * Get all hexagons
-   */
   getAllHexagons(): Hexagon[] {
-    return this.db.prepare('SELECT * FROM hexagons').all() as Hexagon[];
+    return this.state.hexagons;
   }
-
-  /**
-   * Get recent events
-   */
+  getHistoryForRound(round: number): HexSnapshot[] {
+    return this.state.history.filter((s) => s.round === round).sort((a, b) => a.hex_id.localeCompare(b.hex_id));
+  }
+  getEventsForRound(round: number): EventLog[] {
+    return this.state.events.filter((e) => e.round === round);
+  }
   getRecentEvents(limit: number = 10): EventLog[] {
-    return this.db.prepare(`
-      SELECT * FROM events ORDER BY round DESC, id DESC LIMIT ?
-    `).all(limit) as EventLog[];
+    return this.state.events.slice(-limit).reverse();
   }
 }
