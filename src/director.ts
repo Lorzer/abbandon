@@ -7,14 +7,13 @@
  *  - LLMDirector (in llm.ts): Gemini-driven narrative, with output validation.
  */
 
-import type Database from 'better-sqlite3';
-import type { LLMDecision, TriggeredEvent } from './types.js';
+import type { LLMDecision, TriggeredEvent, WorldState } from './types.js';
 import type { SimConfig } from './config.js';
 import { RNG } from './rng.js';
 
 export interface Director {
   initialize(): Promise<void>;
-  getDecision(round: number, db: Database.Database): Promise<LLMDecision>;
+  getDecision(round: number, state: WorldState): Promise<LLMDecision>;
 }
 
 const VALID_EVENT_TYPES: TriggeredEvent['event_type'][] = [

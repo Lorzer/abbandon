@@ -11,18 +11,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { DatabaseInitializer } from '../src/init.js';
+import { createWorld } from '../src/init.js';
 import { SimulationEngine } from '../src/simulation.js';
 import { ScriptedDirector } from '../src/director.js';
 import { makeConfig, type DeepPartial, type SimConfig } from '../src/config.js';
 
 function setup(overrides: DeepPartial<SimConfig> = {}) {
   const config = makeConfig(overrides);
-  const init = new DatabaseInitializer(':memory:', config);
-  init.initialize();
-  const sim = new SimulationEngine(init.getDatabase(), config);
+  const sim = new SimulationEngine(createWorld(config));
   const director = new ScriptedDirector(config);
-  return { config, init, sim, director };
+  return { config, sim, director };
 }
 
 function pops(sim: SimulationEngine) {

@@ -2,6 +2,21 @@
  * ABBADON Phase 1 - Type Definitions
  */
 
+import type { SimConfig } from './config.js';
+
+/**
+ * The complete in-memory simulation state. The engine operates on this object
+ * directly (no database); persistence (Supabase) loads and saves it.
+ */
+export interface WorldState {
+  config: SimConfig;
+  gameState: GameState;
+  hexagons: Hexagon[];
+  edges: Edge[];
+  history: HexSnapshot[];
+  events: EventLog[];
+}
+
 export interface Hexagon {
   id: string;
   type: 'urban' | 'rural';

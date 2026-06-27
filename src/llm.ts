@@ -3,8 +3,7 @@
  */
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import type Database from 'better-sqlite3';
-import type { LLMDecision, Hexagon, GameState, HexChange } from './types.js';
+import type { LLMDecision, Hexagon, GameState, HexChange, WorldState } from './types.js';
 import type { Director } from './director.js';
 import { clampDecision } from './director.js';
 
@@ -38,13 +37,13 @@ export class LLMDirector implements Director {
   /**
    * Get LLM decision for current round
    */
-  async getDecision(round: number, db: Database.Database): Promise<LLMDecision> {
+  async getDecision(round: number, state: WorldState): Promise<LLMDecision> {
     if (!this.isInitialized) {
       await this.initialize();
     }
 
     try {
-      const prompt = this.buildPrompt(round, db);
+      const prompt = this.buildPrompt(round, state);
       console.log(`\nLLM prompt length: ${prompt.length} characters`);
 
       const result = await this.chat.sendMessage(prompt);
@@ -58,13 +57,13 @@ export class LLMDirector implements Director {
       const decision: LLMDecision = clampDecision(JSON.parse(jsonText));
 
       // Store current state for next round's change detection
-      this.storePreviousState(db);
+      this.storePreviousState(state.hexagons);
 
       return decision;
     } catch (error) {
       console.error('LLM Error:', error);
       // Persist the snapshot even on failure so change detection stays anchored.
-      this.storePreviousState(db);
+      this.storePreviousState(state.hexagons);
       return this.getFallbackDecision(round);
     }
   }
@@ -72,9 +71,9 @@ export class LLMDirector implements Director {
   /**
    * Build prompt for LLM (full state on round 1, changes only afterwards)
    */
-  private buildPrompt(round: number, db: Database.Database): string {
-    const gameState = db.prepare('SELECT * FROM game_state WHERE id = 1').get() as GameState;
-    const hexagons = db.prepare('SELECT * FROM hexagons').all() as Hexagon[];
+  private buildPrompt(round: number, state: WorldState): string {
+    const gameState = state.gameState;
+    const hexagons = state.hexagons;
 
     if (round === 1) {
       // Full state for first round
@@ -248,8 +247,7 @@ GLOBAL METRICS:
   /**
    * Store current state for next round's change detection
    */
-  private storePreviousState(db: Database.Database): void {
-    const hexagons = db.prepare('SELECT * FROM hexagons').all() as Hexagon[];
+  private storePreviousState(hexagons: Hexagon[]): void {
     this.previousHexagons.clear();
     for (const hex of hexagons) {
       this.previousHexagons.set(hex.id, { ...hex });

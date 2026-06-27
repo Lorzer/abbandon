@@ -81,56 +81,61 @@ function setPath(obj, path, value) {
   o[keys[keys.length - 1]] = value;
 }
 
-// ---- WebSocket ----
-function connectWebSocket() {
-  ws = new WebSocket(`ws://${window.location.host}`);
-  ws.onopen = () => logToConsole('Connected to server');
-  ws.onmessage = (event) => handleWebSocketMessage(JSON.parse(event.data));
-  ws.onerror = () => logToConsole('Connection error');
-  ws.onclose = () => {
-    logToConsole('Disconnected - retrying...');
-    setTimeout(connectWebSocket, 2000);
-  };
+// ---- API (fetch) ----
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  let data = {};
+  try {
+    data = await res.json();
+  } catch {
+    /* empty body */
+  }
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
 }
 
-function handleWebSocketMessage(message) {
-  const d = message.data || {};
-  switch (message.type) {
-    case 'init':
-      gameState = d.gameState;
-      hexagons = d.hexagons;
-      if (d.config) setConfig(d.config);
-      resetPopHistory();
-      renderAll();
-      logToConsole('Simulation initialized');
-      break;
-    case 'update':
-      gameState = d.gameState;
-      hexagons = d.hexagons;
-      pushPopPoint();
-      renderAll();
-      if (d.events && d.events.length) logToConsole(`Round ${gameState.current_round}: ${d.events[0].description}`);
-      break;
-    case 'reset':
-      gameState = d.gameState;
-      hexagons = d.hexagons;
-      if (d.config) setConfig(d.config);
-      selectedHex = null;
-      resetPopHistory();
-      renderAll();
-      clearConsole();
-      logToConsole('Simulation reset');
-      document.getElementById('playBtn').disabled = false;
-      document.getElementById('stepBtn').disabled = false;
-      break;
-    case 'complete':
-      gameState = d.gameState;
-      renderStats();
-      logToConsole('Simulation complete');
-      document.getElementById('playBtn').disabled = true;
-      document.getElementById('stepBtn').disabled = true;
-      setPlaying(false);
-      break;
+function postJSON(path, body) {
+  return api(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+}
+
+/**
+ * Apply a server state payload ({ gameState, hexagons, events, config }).
+ * `resetPanel` re-syncs the config editor (only on load/reset/config-apply, so
+ * a playing simulation never clobbers unapplied edits).
+ */
+function applyState(data, { resetPanel = false, logEvent = false } = {}) {
+  if (!data) return;
+  if (data.gameState) gameState = data.gameState;
+  if (data.hexagons) hexagons = data.hexagons;
+  if (data.config) {
+    config = data.config;
+    if (resetPanel) {
+      editConfig = structuredClone(config);
+      renderConfig();
+    }
+  }
+  pushPopPoint();
+  renderAll();
+  if (logEvent && data.events && data.events.length) {
+    logToConsole(`Round ${gameState.current_round}: ${data.events[0].description}`);
+  }
+}
+
+async function loadState() {
+  try {
+    const data = await api('/api/state');
+    gameState = data.gameState;
+    hexagons = data.hexagons;
+    if (data.config) setConfig(data.config);
+    resetPopHistory();
+    renderAll();
+    logToConsole('Simulation loaded');
+  } catch (e) {
+    logToConsole('Error loading state: ' + e.message);
   }
 }
 
@@ -194,6 +199,8 @@ function resetPopHistory() {
 }
 function pushPopPoint() {
   if (!gameState) return;
+  const last = popHistory[popHistory.length - 1];
+  if (last && last.round === gameState.current_round) return; // dedupe (e.g. config applies)
   const total = hexagons.reduce((s, h) => s + h.population, 0);
   popHistory.push({ round: gameState.current_round, total });
   if (popHistory.length > 500) popHistory.shift();
@@ -324,16 +331,13 @@ async function applyConfig() {
     return;
   }
   try {
-    const res = await fetch('/api/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(overrides),
-    });
-    const data = await res.json();
-    if (data.config) setConfig(data.config);
+    const data = await postJSON('/api/config', overrides);
+    // A world regeneration returns fresh state; a live change returns updated state too.
+    applyState(data, { resetPanel: true });
+    if (data.message && data.message.includes('regenerated')) resetPopHistory();
     logToConsole(data.message || 'Config applied');
   } catch (e) {
-    logToConsole('Error applying config');
+    logToConsole('Error applying config: ' + e.message);
   }
 }
 
@@ -528,84 +532,108 @@ function formatPopulation(pop) {
   return String(Math.round(pop));
 }
 
-// ---- Transport ----
+// ---- Transport (client-driven play loop; the server only does single steps) ----
 let playing = false;
+let playTimer = null;
+
 function setPlaying(on) {
   playing = on;
   document.getElementById('playBtn').disabled = on;
   document.getElementById('pauseBtn').disabled = !on;
+}
+function stopPlaying() {
+  setPlaying(false);
+  if (playTimer) {
+    clearTimeout(playTimer);
+    playTimer = null;
+  }
 }
 function currentIntervalMs() {
   const speed = Number(document.getElementById('speed').value) || 1;
   return Math.round(2000 / speed);
 }
 
-document.getElementById('playBtn').addEventListener('click', async () => {
+/** Run one round. Returns true if the simulation can continue. */
+async function doStep() {
   try {
-    await fetch('/api/play', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ intervalMs: currentIntervalMs() }),
-    });
-    setPlaying(true);
-  } catch {
-    logToConsole('Error starting playback');
+    const data = await postJSON('/api/step', {});
+    applyState(data, { logEvent: true });
+    if (data.message === 'Simulation complete' || (config && gameState.current_round >= config.totalRounds)) {
+      stopPlaying();
+      document.getElementById('playBtn').disabled = true;
+      document.getElementById('stepBtn').disabled = true;
+      logToConsole('Simulation complete');
+      return false;
+    }
+    return true;
+  } catch (e) {
+    logToConsole('Step error: ' + e.message);
+    stopPlaying();
+    return false;
   }
-});
-document.getElementById('pauseBtn').addEventListener('click', async () => {
-  try {
-    await fetch('/api/pause', { method: 'POST' });
-    setPlaying(false);
-  } catch {
-    logToConsole('Error pausing');
-  }
-});
-document.getElementById('stepBtn').addEventListener('click', async () => {
-  try {
-    await fetch('/api/step', { method: 'POST' });
-  } catch {
-    logToConsole('Error stepping');
-  }
+}
+
+function startPlaying() {
+  if (playing) return;
+  setPlaying(true);
+  const tick = async () => {
+    if (!playing) return;
+    const ok = await doStep(); // awaited -> never overlaps the previous round
+    if (ok && playing) playTimer = setTimeout(tick, currentIntervalMs()); // picks up speed changes
+  };
+  tick();
+}
+
+document.getElementById('playBtn').addEventListener('click', startPlaying);
+document.getElementById('pauseBtn').addEventListener('click', stopPlaying);
+document.getElementById('stepBtn').addEventListener('click', () => {
+  if (!playing) doStep();
 });
 document.getElementById('resetBtn').addEventListener('click', async () => {
   if (!confirm('Reset the simulation?')) return;
+  stopPlaying();
   try {
-    await fetch('/api/reset', { method: 'POST' });
-    setPlaying(false);
-  } catch {
-    logToConsole('Error resetting');
+    const data = await postJSON('/api/reset', {});
+    gameState = data.gameState;
+    hexagons = data.hexagons;
+    if (data.config) setConfig(data.config);
+    selectedHex = null;
+    clearConsole();
+    resetPopHistory();
+    renderAll();
+    document.getElementById('playBtn').disabled = false;
+    document.getElementById('stepBtn').disabled = false;
+    logToConsole('Simulation reset');
+  } catch (e) {
+    logToConsole('Error resetting: ' + e.message);
   }
 });
-document.getElementById('speed').addEventListener('input', async (e) => {
+document.getElementById('speed').addEventListener('input', (e) => {
   document.getElementById('speedValue').textContent = `${e.target.value}×`;
-  if (playing) {
-    // Re-arm the play loop at the new speed.
-    await fetch('/api/pause', { method: 'POST' });
-    await fetch('/api/play', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ intervalMs: currentIntervalMs() }),
-    });
-  }
+  // The next tick reads currentIntervalMs(), so no re-arm needed.
 });
 document.getElementById('forkBtn').addEventListener('click', async () => {
   const round = Number(document.getElementById('rewind').value);
+  stopPlaying();
   try {
-    const res = await fetch('/api/fork', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ round }),
-    });
-    const data = await res.json();
-    logToConsole(data.message || data.error || 'Forked');
-  } catch {
-    logToConsole('Error forking');
+    const data = await postJSON('/api/fork', { round });
+    gameState = data.gameState;
+    hexagons = data.hexagons;
+    if (data.config) {
+      config = data.config;
+      editConfig = structuredClone(config);
+      renderConfig();
+    }
+    popHistory = popHistory.filter((p) => p.round <= round);
+    renderAll();
+    logToConsole(data.message || `Forked from round ${round}`);
+  } catch (e) {
+    logToConsole('Fork error: ' + e.message);
   }
 });
 function updateRewindMax() {
   if (!gameState) return;
-  const input = document.getElementById('rewind');
-  input.max = gameState.current_round;
+  document.getElementById('rewind').max = gameState.current_round;
 }
 
 document.getElementById('overlay').addEventListener('change', (e) => {
@@ -623,4 +651,4 @@ document.getElementById('revertBtn').addEventListener('click', () => {
 // ---- Boot ----
 renderLegend();
 resizeCanvas();
-connectWebSocket();
+loadState();
