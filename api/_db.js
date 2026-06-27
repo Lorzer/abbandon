@@ -7,7 +7,7 @@
 
 import { createClient } from '@supabase/supabase-js';
 import { createWorld } from '../dist/init.js';
-import { ScriptedDirector } from '../dist/director.js';
+import { ScriptedDirector, GemmaDirector } from '../dist/director.js';
 import { DEFAULT_CONFIG, applyConfig, requiresReinit } from '../dist/config.js';
 
 const HEX_COLS = [
@@ -28,7 +28,11 @@ export function sb() {
 }
 
 export function makeDirector(config) {
-  // Production is scripted-only (deterministic, no API key).
+  // Opt-in LLM: Gemma 4 via the colla_gemma edge function when enabled and
+  // Supabase creds are present; otherwise the deterministic scripted director.
+  if (config.useLLM && process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    return new GemmaDirector(config);
+  }
   return new ScriptedDirector(config);
 }
 

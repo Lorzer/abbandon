@@ -18,6 +18,12 @@ export interface SimConfig {
   /** When false, a deterministic ScriptedDirector drives weather (no network, reproducible). */
   useLLM: boolean;
 
+  /** LLM director settings (Gemma 4 via the colla_gemma Supabase edge function). */
+  llm: {
+    model: string;
+    thinkingLevel: 'low' | 'medium' | 'high';
+  };
+
   /** Total rounds in a run (months). 60 = 5 years. */
   totalRounds: number;
 
@@ -112,6 +118,10 @@ export interface HexTemplate {
 export const DEFAULT_CONFIG: SimConfig = {
   seed: 1,
   useLLM: false,
+  llm: {
+    model: 'gemma-4-31b-it',
+    thinkingLevel: 'high',
+  },
   totalRounds: 60,
 
   world: {
